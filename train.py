@@ -10,7 +10,6 @@ from transformers import (
 from datasets import Dataset
 
 
-# def tokenize_function(examples, padding="max_length", max_tok_len=1000):
 def tokenize_function(examples, tokenizer, padding="max_length", max_tok_len=None):
     # tokenize inputs
     model_inputs = tokenizer(
@@ -39,7 +38,10 @@ def tokenize_function(examples, tokenizer, padding="max_length", max_tok_len=Non
     model_inputs["labels"] = labels["input_ids"]
     return model_inputs
 
-def gen_dataset(tokenizer):
+def gen_dataset(tokenizer, max_asm_seq_len=512):
+    '''
+    TODO: OOP-ify this cod and get max_asm_seq_len from the model
+    '''
     S_TEXTS = []
     C_TEXTS = []
 
@@ -52,6 +54,12 @@ def gen_dataset(tokenizer):
                 asm_text = f.read()
             with open(Path(root) / dir / "raw.c") as f:
                 c_text = f.read()
+
+            # Only keep data with token sequence length within max model sequence input length
+            num_asm_toks = len(tokenizer(asm_text, return_tensors="pt").input_ids[0])
+            if num_asm_toks > max_asm_seq_len:
+                continue
+
             S_TEXTS.append(asm_text)
             C_TEXTS.append(c_text)
 
@@ -65,8 +73,11 @@ def gen_dataset(tokenizer):
     ds = Dataset.from_dict({"asm": S_TEXTS, "text": C_TEXTS})
 
     tokenized_datasets = ds.map(lambda x : tokenize_function(x, tokenizer=tokenizer), batched=True)
+
+    num_test = 100
+    num_train = len(tokenized_datasets) - num_test
     final_ds = tokenized_datasets.train_test_split(
-        train_size=2000, test_size=100, seed=1334
+        train_size=num_train, test_size=num_test, seed=1334
     )
     return final_ds
 
