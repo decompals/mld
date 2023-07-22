@@ -48,6 +48,9 @@ def gen_dataset(tokenizer, max_asm_seq_len=512):
     MAX_SOURCE_LENGTH = 0
     MAX_TARGET_LENGTH = 0
 
+    num_seq_exceed_len = 0
+    data_total = 0
+
     for root, dirs, files in os.walk("data"):
         for dir in dirs:
             with open(Path(root) / dir / "clean.s") as f:
@@ -55,9 +58,11 @@ def gen_dataset(tokenizer, max_asm_seq_len=512):
             with open(Path(root) / dir / "raw.c") as f:
                 c_text = f.read()
 
+            data_total += 1
             # Only keep data with token sequence length within max model sequence input length
             num_asm_toks = len(tokenizer(asm_text, return_tensors="pt").input_ids[0])
             if num_asm_toks > max_asm_seq_len:
+                num_seq_exceed_len += 1
                 continue
 
             S_TEXTS.append(asm_text)
@@ -68,6 +73,8 @@ def gen_dataset(tokenizer, max_asm_seq_len=512):
 
             if len(c_text) > MAX_TARGET_LENGTH:
                 MAX_TARGET_LENGTH = len(c_text)
+
+    print(f"Number of sequences skipped due to exceeded length: {num_seq_exceed_len}/{len(S_TEXTS)}")
 
 
     ds = Dataset.from_dict({"asm": S_TEXTS, "text": C_TEXTS})
