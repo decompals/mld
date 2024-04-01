@@ -54,7 +54,7 @@ def gen_dataset(tokenizer, max_asm_seq_len=512):
 
     for root, dirs, files in os.walk("harvest"):
         for dir in dirs:
-            with open(Path(root) / dir / "santized.s") as f:
+            with open(Path(root) / dir / "sanitized.s") as f:
                 asm_text = f.read()
             with open(Path(root) / dir / "sanitized.c") as f:
                 c_text = f.read()
