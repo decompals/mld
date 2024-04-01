@@ -38,10 +38,11 @@ def tokenize_function(examples, tokenizer, padding="max_length", max_tok_len=Non
     model_inputs["labels"] = labels["input_ids"]
     return model_inputs
 
+
 def gen_dataset(tokenizer, max_asm_seq_len=512):
-    '''
+    """
     TODO: OOP-ify this cod and get max_asm_seq_len from the model
-    '''
+    """
     S_TEXTS = []
     C_TEXTS = []
 
@@ -51,11 +52,11 @@ def gen_dataset(tokenizer, max_asm_seq_len=512):
     num_seq_exceed_len = 0
     data_total = 0
 
-    for root, dirs, files in os.walk("data"):
+    for root, dirs, files in os.walk("harvest"):
         for dir in dirs:
-            with open(Path(root) / dir / "clean.s") as f:
+            with open(Path(root) / dir / "santized.s") as f:
                 asm_text = f.read()
-            with open(Path(root) / dir / "raw.c") as f:
+            with open(Path(root) / dir / "sanitized.c") as f:
                 c_text = f.read()
 
             data_total += 1
@@ -74,12 +75,15 @@ def gen_dataset(tokenizer, max_asm_seq_len=512):
             if len(c_text) > MAX_TARGET_LENGTH:
                 MAX_TARGET_LENGTH = len(c_text)
 
-    print(f"Number of sequences skipped due to exceeded length: {num_seq_exceed_len}/{len(S_TEXTS)}")
-
+    print(
+        f"Number of sequences skipped due to exceeded length: {num_seq_exceed_len}/{len(S_TEXTS)}"
+    )
 
     ds = Dataset.from_dict({"asm": S_TEXTS, "text": C_TEXTS})
 
-    tokenized_datasets = ds.map(lambda x : tokenize_function(x, tokenizer=tokenizer), batched=True)
+    tokenized_datasets = ds.map(
+        lambda x: tokenize_function(x, tokenizer=tokenizer), batched=True
+    )
 
     num_test = 100
     num_train = len(tokenized_datasets) - num_test
@@ -87,6 +91,7 @@ def gen_dataset(tokenizer, max_asm_seq_len=512):
         train_size=num_train, test_size=num_test, seed=1334
     )
     return final_ds
+
 
 def main():
     tokenizer = AutoTokenizer.from_pretrained("Salesforce/codet5-small")
@@ -108,11 +113,11 @@ def main():
         model=model,
         args=training_args,
         train_dataset=final_ds["train"],
-        eval_dataset=final_ds["test"]
+        eval_dataset=final_ds["test"],
     )
 
     trainer.train()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 
 import argparse
+from functools import lru_cache
 import glob
 import os
+from dataclasses import dataclass
+from pathlib import Path
 import re
 import shutil
 import subprocess
-import sys
-from collections import OrderedDict
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
+from mapfile_parser import MapFile
 
-from sty import fg
+from pycparser import c_ast as ca
+from pycparser import c_generator, c_parser
+
+from c_types import build_typemap, parse_struct, type_of_var_decl
+from ast_types import decayed_expr_type, expr_type
 
 script_dir = Path(os.path.dirname(os.path.realpath(__file__)))
-root_dir = script_dir / ".."
+root_dir = script_dir / "../.." / "papermario"
 asm_dir = root_dir / "ver/current/asm/nonmatchings/"
 build_dir = root_dir / "ver/current/build/"
 elf_path = build_dir / "papermario.elf"
@@ -23,6 +27,22 @@ map_file_path = build_dir / "papermario.map"
 rom_path = root_dir / "ver/current/baserom.z64"
 
 OBJDUMP = "mips-linux-gnu-objdump"
+
+CPP_FLAGS = [
+    "-Iinclude",
+    "-Isrc",
+    "-Iassets",
+    "-Iassets/us",
+    "-Iver/current/build/include",
+    "-D_LANGUAGE_C",
+    "-DF3DEX_GBI_2",
+    "-D_MIPS_SZLONG=32",
+    "-DSCRIPT(...)={}",
+    "-D__attribute__(...)=",
+    "-D__asm__(...)=",
+    "-ffreestanding",
+    "-DM2CTX",
+]
 
 
 @dataclass
@@ -51,290 +71,302 @@ def read_rom() -> bytes:
         return f.read()
 
 
-def get_func_sizes() -> Dict[str, int]:
-    try:
-        result = subprocess.run(
-            ["mips-linux-gnu-objdump", "-x", elf_path], stdout=subprocess.PIPE
-        )
-        nm_lines = result.stdout.decode().split("\n")
-    except:
-        print(
-            f"Error: Could not run objdump on {elf_path} - make sure that the project is built"
-        )
-        sys.exit(1)
-
-    sizes: Dict[str, int] = {}
-
-    for line in nm_lines:
-        if " F " in line:
-            components = line.split()
-            size = int(components[4], 16)
-            name = components[5]
-            sizes[name] = size
-
-    return sizes
-
-
-def get_symbol_bytes(func: str) -> Optional[Bytes]:
-    if func not in syms or syms[func].rom_end is None:
-        return None
-    sym = syms[func]
-    bs = list(rom_bytes[sym.rom_start : sym.rom_end])
-
-    # trim nops
-    while len(bs) > 0 and bs[-1] == 0:
-        bs.pop()
-
-    insns = bs[0::4]
-
-    ret = []
-    for ins in insns:
-        ret.append(ins >> 2)
-
-    return Bytes(0, bytes(ret).decode("utf-8"), rom_bytes[sym.rom_start : sym.rom_end])
-
-
-def parse_map() -> OrderedDict[str, Symbol]:
-    ram_offset = None
-    cur_file = "<no file>"
-    syms: OrderedDict[str, Symbol] = OrderedDict()
-    prev_sym = ""
-    prev_line = ""
-    cur_sect = ""
-    sect_re = re.compile(r"\(\..*\)")
-    with open(map_file_path) as f:
-        for line in f:
-            sect = sect_re.search(line)
-            if sect:
-                sect_str = sect.group(0)
-                if sect_str in ["(.text*)", "(.data*)", "(.rodata*)", "(.bss*)"]:
-                    cur_sect = sect_str
-
-            if "load address" in line:
-                if "noload" in line or "noload" in prev_line:
-                    ram_offset = None
-                    continue
-                ram = int(line[16 : 16 + 18], 0)
-                rom = int(line[59 : 59 + 18], 0)
-                ram_offset = ram - rom
-                continue
-            prev_line = line
-
-            if (
-                ram_offset is None
-                or "=" in line
-                or "*fill*" in line
-                or " 0x" not in line
-            ):
-                continue
-            ram = int(line[16 : 16 + 18], 0)
-            rom = ram - ram_offset
-            fn = line.split()[-1]
-            if "0x" in fn:
-                ram_offset = None
-            elif "/" in fn:
-                cur_file = fn
-            else:
-                if cur_sect != "(.text*)":
-                    continue
-                new_sym = Symbol(
-                    name=fn,
-                    rom_start=rom,
-                    ram=ram,
-                    current_file=Path(cur_file),
-                    prev_sym=prev_sym,
-                )
-                if fn in func_sizes:
-                    new_sym.rom_end = rom + func_sizes[fn]
-                syms[fn] = new_sym
-                prev_sym = fn
-
-    # Calc end offsets
-    for sym in syms:
-        prev_sym = syms[sym].prev_sym
-        if prev_sym and not syms[prev_sym].rom_end:
-            syms[prev_sym].rom_end = syms[sym].rom_start
-
-    return syms
-
-
-LN_CACHE: Dict[Path, Dict[int, int]] = {}
-
-
-def get_line_numbers(obj_file: Path) -> Dict[int, int]:
-    if obj_file in LN_CACHE:
-        return LN_CACHE[obj_file]
-
-    objdump_out = (
-        subprocess.run(
-            [OBJDUMP, "-WL", obj_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        .stdout.decode("utf-8")
-        .split("\n")
-    )
-
-    if not objdump_out:
-        LN_CACHE[obj_file] = {}
-    else:
-        ret = {}
-        for line in objdump_out[7:]:
-            if not line:
-                continue
-            pieces = line.split()
-
-            if len(pieces) < 3:
-                continue
-
-            fn = pieces[0]
-
-            if fn == OBJDUMP or fn[0] == "<":
-                continue
-
-            starting_addr = int(pieces[2], 0)
-            try:
-                line_num = int(pieces[1])
-                ret[starting_addr] = line_num
-            except ValueError:
-                continue
-        LN_CACHE[obj_file] = ret
-
-    return LN_CACHE[obj_file]
-
-
-def get_tu_offset(obj_file: Path, symbol: str) -> Optional[int]:
-    objdump = "mips-linux-gnu-objdump"
-
-    objdump_out = (
-        subprocess.run([objdump, "-t", obj_file], stdout=subprocess.PIPE)
-        .stdout.decode("utf-8")
-        .split("\n")
-    )
-
-    if not objdump_out:
-        return None
-
-    for line in objdump_out[4:]:
-        if not line:
-            continue
-        pieces = line.split()
-
-        if pieces[-1] == symbol:
-            return int(pieces[0], 16)
-    return None
-
-
-@dataclass
-class CRange:
-    start: Optional[int] = None
-    end: Optional[int] = None
-    start_exact = False
-    end_exact = False
-
-    def has_info(self):
-        return self.start is not None or self.end is not None
-
-    def __str__(self):
-        start_str = "?"
-        end_str = "?"
-
-        if self.start is not None:
-            if self.start_exact:
-                start_str = f"{self.start}"
-            else:
-                start_str = f"~{self.start}"
-
-        if self.end is not None:
-            if self.end_exact:
-                end_str = f"{self.end}"
-            else:
-                end_str = f"~{self.end}"
-
-        return f"{start_str} - {end_str}"
-
-
-def get_c_range(insn_start: int, insn_end: int, line_numbers: Dict[int, int]) -> CRange:
-    range = CRange()
-
-    if insn_start in line_numbers:
-        range.start = line_numbers[insn_start]
-        range.start_exact = True
-    else:
-        keys = list(line_numbers.keys())
-        for i, key in enumerate(keys[:-1]):
-            if keys[i + 1] > insn_start:
-                range.start = line_numbers[keys[i]]
-                break
-
-    if insn_end in line_numbers:
-        range.end = line_numbers[insn_end]
-        range.end_exact = True
-    else:
-        keys = list(line_numbers.keys())
-        for i, key in enumerate(keys):
-            if key > insn_end:
-                range.end = line_numbers[key]
-                break
-
-    return range
+def parse_map() -> MapFile:
+    mf = MapFile()
+    mf.readMapFile(map_file_path)
+    return mf
 
 
 parser = argparse.ArgumentParser(description="Harvester")
 args = parser.parse_args()
+c_parser = c_parser.CParser()
+
+
+def set_decl_name(decl: ca.Decl, name: str) -> None:
+    if isinstance(decl, ca.ID):
+        decl.name = name
+        return
+
+    type = type_of_var_decl(decl)
+    while not isinstance(type, ca.TypeDecl):
+        type = type.type
+    type.declname = name
+    decl.name = name
+
+
+@lru_cache(maxsize=None)
+def get_ast(file: Path):
+    cpp_command = ["mips-linux-gnu-cpp", "-E", "-P", *CPP_FLAGS, file]
+
+    file_text = subprocess.check_output(cpp_command, cwd=root_dir, encoding="utf-8")
+    ast = c_parser.parse(file_text, filename=file.name)
+    return ast
+
+
+def get_struct_offset(typemap, struct_name, field_name):
+    struct = None
+
+    if struct_name in typemap.typedefs:
+        c_type = typemap.typedefs[struct_name]
+        if isinstance(c_type.type, ca.Struct):
+            struct = parse_struct(c_type.type, typemap)
+        else:
+            raise Exception(f"???")
+    else:
+        raise Exception(f"???")
+
+    if struct is None:
+        raise ValueError(f"Couldn't find struct {struct_name}")
+
+    for offset, field in struct.fields.items():
+        for f in field:
+            if f.name == field_name:
+                return offset
+
+    raise ValueError(f"Couldn't find field {field_name} in struct {struct_name}")
+
+
+def synthesize_func(ast, symbol: str):
+    func_ast = None
+    for node in reversed(ast.ext):
+        if isinstance(node, ca.FuncDef) and node.decl.name == symbol:
+            func_ast = node
+            break
+    if func_ast is None:
+        raise ValueError(f"Couldn't find function {symbol}")
+
+    generator = c_generator.CGenerator()
+    orig_c = generator.visit(func_ast)
+
+    typemap = build_typemap(ast)
+
+    rename_map = {}
+
+    # Rename the function to "func"
+    set_decl_name(func_ast.decl, "func")
+
+    if symbol == "set_time_freeze_mode":
+        dog = 5
+
+    # Do the renaming
+    class SymVisitor(ca.NodeVisitor):
+        num_funcs = 0
+        num_syms = 0
+        num_types = 0
+
+        def visit_FuncCall(self, node):
+            func_name = node.name.name
+            if func_name not in rename_map:
+                rename_map[func_name] = "func" + str(self.num_funcs)
+                self.num_funcs += 1
+            self.generic_visit(node)
+            node.name.name = rename_map[func_name]
+
+        def visit_IdentifierType(self, node):
+            for name in node.names:
+                if name not in [
+                    "void",
+                    "s8",
+                    "u8",
+                    "s16",
+                    "u16",
+                    "s32",
+                    "u32",
+                    "f32",
+                    "s64",
+                    "u64",
+                    "unsigned",
+                    "signed",
+                    "char",
+                    "short",
+                    "int",
+                    "long",
+                    "float",
+                    "double",
+                    "const",
+                    "volatile",
+                    "struct",
+                    "union",
+                    "enum",
+                ]:
+                    if name not in rename_map:
+                        rename_map[name] = "type" + str(self.num_types)
+                    node.names[node.names.index(name)] = rename_map[name]
+            self.generic_visit(node)
+
+        def visit_ID(self, node):
+            if node.name not in rename_map:
+                new_name = None
+                # Try enum lookup first
+                if node.name in typemap.enum_values:
+                    new_name = f"0x{typemap.enum_values[node.name]:X}"
+                if new_name is None:
+                    new_name = "sym" + str(self.num_syms)
+                    self.num_syms += 1
+                rename_map[node.name] = new_name
+            node.name = rename_map[node.name]
+            self.generic_visit(node)
+
+        # Field
+        def visit_StructRef(self, node):
+            try:
+                typ = decayed_expr_type(node.name, typemap)
+                if isinstance(typ, ca.PtrDecl):
+                    struct_name = typ.type.type.names[0]
+                else:
+                    struct_name = typ.type.names[0]
+
+                offset = get_struct_offset(typemap, struct_name, node.field.name)
+                self.generic_visit(node)
+                set_decl_name(node.field, f"field_{offset:X}")
+            except Exception as e:
+                self.generic_visit(node)
+                set_decl_name(node.field, f"field_ERROR")
+
+        def visit_ParamList(self, node):
+            for i, param in enumerate(node.params):
+                if isinstance(param, ca.EllipsisParam):
+                    return
+
+                if param.name not in rename_map:
+                    rename_map[param.name] = "arg" + str(i)
+                set_decl_name(param, rename_map[param.name])
+                self.generic_visit(param)
+
+        def visit_Decl(self, node):
+            if node == func_ast.decl:
+                self.generic_visit(node)
+                return
+
+            if node.name not in rename_map:
+                rename_map[node.name] = "sym" + str(self.num_syms)
+                self.num_syms += 1
+            set_decl_name(node, rename_map[node.name])
+            self.generic_visit(node)
+
+    SymVisitor().visit(func_ast)
+
+    # Write back to c
+    generator = c_generator.CGenerator()
+    new_c = generator.visit(func_ast)
+    # print(out)
+
+    return orig_c, new_c
+
+
+def santize_asm(lines, symbol):
+    sanitized = []
+    num_labels = 0
+    num_funcs = 0
+    num_syms = 0
+    rename_map = {}
+
+    # Find all labels
+    for line in lines:
+        line = line.strip()
+
+        label_match = re.match(r"\.(.+):", line)
+        if label_match:
+            label = label_match.group(1)
+            if label not in rename_map:
+                rename_map[label] = f"L{num_labels}"
+                num_labels += 1
+
+    for i, line in enumerate(lines):
+        line = line.strip()
+
+        # Remove comments
+        while "/*" in line:
+            start = line.index("/*")
+            end = line.index("*/")
+            line = (line[:start] + line[end + 2 :]).strip()
+
+        # Remove extra spaces
+        line = " ".join(line.split())
+
+        # Rename function to func
+        if line == "glabel " + symbol:
+            line = "glabel func"
+            sanitized.append(line)
+            continue
+
+        # Replace labels
+        label_match = re.match(r".*\.([A-Z0-9]+)", line)
+        if label_match:
+            label = label_match.group(1)
+            if label in rename_map:
+                line = line.replace(label, rename_map[label])
+
+        # Replace function calls
+        jal_match = re.match(r"jal\s+(.+)", line)
+        if jal_match:
+            func = jal_match.group(1)
+            if func not in rename_map:
+                rename_map[func] = f"func{num_funcs}"
+                num_funcs += 1
+            line = line.replace(func, rename_map[func])
+
+        # Replace symbols
+        hi_match = re.match(r".*%hi\((.+)\)", line)
+        if hi_match:
+            sym = hi_match.group(1)
+            if sym not in rename_map:
+                rename_map[sym] = f"sym{num_syms}"
+                num_syms += 1
+            line = line.replace(sym, rename_map[sym])
+
+        lo_match = re.match(r".*%lo\((.+)\)", line)
+        if lo_match:
+            sym = lo_match.group(1)
+            if ")" in sym:
+                sym = sym[: sym.index(")")]
+            if sym not in rename_map:
+                rename_map[sym] = f"sym{num_syms}"
+                num_syms += 1
+            line = line.replace(sym, rename_map[sym])
+
+        sanitized.append(line)
+
+    return "\n".join(sanitized)
+
 
 if __name__ == "__main__":
     rom_bytes = read_rom()
-    func_sizes = get_func_sizes()
-    syms = parse_map()
+    map = parse_map()
 
-    for symbol in syms:
-        dog = 5
-        if syms[symbol].current_file.name.endswith(".c.o"):
-            c_file = str(syms[symbol].current_file)[13:-2]
+    for file in map.filesList:
+        if file.segmentType == ".text" and file.filepath.name.endswith(".c.o"):
+            c_file = str(file.getName())[6:]
+            ast = get_ast(root_dir / c_file)
 
-            with open(c_file) as f:
-                lines = f.readlines()
+            for symbol in file.symbols:
+                orig_c, santized_c = synthesize_func(ast, symbol.name)
 
-            start_line: Optional[int] = None
-            end_line: Optional[int] = None
+                orig_asm_path = Path("data") / symbol.name / "raw.s"
 
-            for i, line in enumerate(lines):
-                if symbol in line and line.endswith("{\n"):
-                    start_line = i
-                    break
+                if not orig_asm_path.exists():
+                    print(f"Skipping {symbol.name} - no original ASM found")
+                    continue
 
-            if start_line is None:
-                continue
+                with open(orig_asm_path, "r") as f:
+                    orig_asm = f.readlines()
 
-            for i, line in enumerate(lines[start_line + 1 :]):
-                if line == "}\n":
-                    end_line = start_line + i + 2
-                    break
+                sanitized_asm = santize_asm(orig_asm, symbol.name)
 
-            if end_line is None:
-                continue
+                out_dir = Path(f"harvest/{symbol.name}")
+                out_dir.mkdir(parents=True, exist_ok=True)
 
-            asm_glob = glob.glob(
-                f"ver/us/asm/nonmatchings/**/{symbol}.s",
-                recursive=True,
-            )
+                with open(out_dir / "raw.c", "w") as f:
+                    f.write(orig_c)
 
-            if len(asm_glob) < 1:
-                print(f"Couldn't find asm for {symbol}")
-                continue
+                with open(out_dir / "sanitized.c", "w") as f:
+                    f.write(santized_c)
 
-            if len(asm_glob) > 1:
-                print(f"Found multiple asm files for {symbol}")
-                continue
+                with open(out_dir / "raw.s", "w") as f:
+                    f.writelines(orig_asm)
 
-            asm_file = asm_glob[0]
+                with open(out_dir / "sanitized.s", "w") as f:
+                    f.write(sanitized_asm)
 
-            out_dir = Path(f"harvest/{symbol}")
-            out_dir.mkdir(parents=True, exist_ok=True)
-
-            with open(out_dir / "raw.c", "w") as f:
-                func = "".join(lines[start_line:end_line])
-                f.write(func)
-
-            shutil.copy(asm_file, out_dir / "raw.s")
+                # with open(out_dir / "raw.bin", "wb") as f:
+                #     f.write(rom_bytes[symbol.vrom : symbol.vrom + symbol.size])
