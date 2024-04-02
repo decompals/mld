@@ -12,7 +12,7 @@ from train import gen_dataset
 
 def main():
     tokenizer = AutoTokenizer.from_pretrained("Salesforce/codet5-small")
-    model = AutoModelForSeq2SeqLM.from_pretrained("test_trainer/checkpoint-20000")
+    model = AutoModelForSeq2SeqLM.from_pretrained("test_trainer/checkpoint-15000")
     metric = evaluate.load('bleu')
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 

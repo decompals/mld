@@ -76,7 +76,7 @@ def gen_dataset(tokenizer, max_asm_seq_len=512):
                 MAX_TARGET_LENGTH = len(c_text)
 
     print(
-        f"Number of sequences skipped due to exceeded length: {num_seq_exceed_len}/{len(S_TEXTS)}"
+        f"Number of sequences skipped due to exceeded length: {num_seq_exceed_len}, suitable samples: {len(S_TEXTS)}"
     )
 
     ds = Dataset.from_dict({"asm": S_TEXTS, "text": C_TEXTS})
