@@ -87,10 +87,13 @@ def set_decl_name(decl: ca.Decl, name: str) -> None:
         decl.name = name
         return
 
-    type = type_of_var_decl(decl)
-    while not isinstance(type, ca.TypeDecl):
-        type = type.type
-    type.declname = name
+    try:
+        type = type_of_var_decl(decl)
+        while not isinstance(type, ca.TypeDecl):
+            type = type.type
+        type.declname = name
+    except Exception as e:
+        print(e)
     decl.name = name
 
 
@@ -99,7 +102,10 @@ def get_ast(file: Path):
     cpp_command = ["mips-linux-gnu-cpp", "-E", "-P", *CPP_FLAGS, file]
 
     file_text = subprocess.check_output(cpp_command, cwd=root_dir, encoding="utf-8")
-    ast = c_parser.parse(file_text, filename=file.name)
+    try:
+        ast = c_parser.parse(file_text, filename=file.stem)
+    except Exception as e:
+        ast = None
     return ast
 
 
@@ -155,12 +161,15 @@ def synthesize_func(ast, symbol: str):
         num_types = 0
 
         def visit_FuncCall(self, node):
-            func_name = node.name.name
-            if func_name not in rename_map:
-                rename_map[func_name] = "func" + str(self.num_funcs)
-                self.num_funcs += 1
-            self.generic_visit(node)
-            node.name.name = rename_map[func_name]
+            try:
+                func_name = node.name.name
+                if func_name not in rename_map:
+                    rename_map[func_name] = "func" + str(self.num_funcs)
+                    self.num_funcs += 1
+                self.generic_visit(node)
+                node.name.name = rename_map[func_name]
+            except Exception as e:
+                pass
 
         def visit_IdentifierType(self, node):
             for name in node.names:
@@ -248,7 +257,11 @@ def synthesize_func(ast, symbol: str):
 
     # Write back to c
     generator = c_generator.CGenerator()
-    new_c = generator.visit(func_ast)
+    try:
+        new_c = generator.visit(func_ast)
+    except Exception as e:
+        print(e)
+        new_c = None
     # print(out)
 
     return orig_c, new_c
@@ -339,8 +352,16 @@ if __name__ == "__main__":
             c_file = str(file.getName())[6:]
             ast = get_ast(root_dir / c_file)
 
+            if ast is None:
+                print(f"Skipping {file.getName()} - C parse error")
+                continue
+
             for symbol in file.symbols:
                 orig_c, santized_c = synthesize_func(ast, symbol.name)
+
+                if santized_c is None:
+                    print(f"Skipping {symbol.name} - C render error")
+                    continue
 
                 orig_asm_path = Path("data") / symbol.name / "raw.s"
 
